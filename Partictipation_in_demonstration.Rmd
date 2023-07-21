@@ -1,0 +1,440 @@
+library(ggplot2)
+library(rsample)
+library(dplyr)
+library(caret)
+library(e1071)
+library(pROC)
+library(ROSE)
+library(yardstick)
+library(ROCR)
+library(tidyverse)
+
+# Import Dataset
+data <- read.csv('/Users/akakikuprashvili/Desktop/Big Data/ESS9e03_1-4/ESS9e03_1.csv')
+
+# Since we don't expect variance to be similar across countrie, we settle for western European countries from the dataset. Also, with the initial assessment we hypothesize which features could be used for predicting pbldmn outcome.
+selected_columns_1 <- data %>%
+  filter(cntry %in% c('BG', 'AT', 'DE', 'GB', 'IT', 'IE')) %>%
+  select(polintr, sgnptit, pbldmn, cptppola, badge, pstplonl, nwspol, netusoft, netustm, ppltrst, pplhlp, pplfair, gvintcz, poltran, frprtpl, agea, ipstrgv)
+
+# We drop missing data
+filtered_data_1 <- selected_columns_1 %>%
+  filter(
+    !(pbldmn %in% c(7, 8, 9)), #Dict - Taken part in lawful public demonstration last 12 months
+    !(polintr %in% c(7, 8, 9)), #Cont - How interested in politics
+    !(sgnptit %in% c(7, 8, 9)), #Dict - Signed petition last 12 months
+    !(cptppola %in% c(7, 8, 9)), #Cont - Confident in own ability to participate in politics
+    !(badge %in% c(7, 8, 9)), #Dict - Worn or displayed campaign badge/sticker last 12 months
+    !(nwspol %in% c(7777, 8888, 9999)), #Cont - News about politics and curren ... ading or listening, in minutes
+    !(frprtpl %in% c(7, 8, 9)), #Cont - Political system in country en ... nce to participate in politics
+    !(poltran %in% c(7, 8, 9)), #Cont - Decisions in country politics are transparent
+    !(gvintcz %in% c(7, 8, 9)), #Cont - Government in country takes in ... the interests of all citizens
+    !(pstplonl %in% c(7, 8, 9)), #Dict - Posted or shared anything about politics online last 12 months
+    !(netusoft %in% c(7, 8, 9)), #Cont - Internet use, how often
+    !(netustm %in% c(6666, 7777, 8888, 9999)), #Cont  - Internet use, how much time on typical day, in minutes
+    !(ppltrst %in% c(77, 88, 99)), #Cont - Most people can be trusted or you can't be too careful
+    !(pplhlp %in% c(77, 88, 99)), #Cont - Most of the time people helpfu ... tly looking out for themselves
+    !(pplfair %in% c(77, 88, 99)), #Cont - Most people try to take advantage of you, or try to be fair
+    !(agea %in% c(999)), #Cont - Age of the respondent
+    !(ipstrgv %in% c(7, 8, 9)) #Cont - Important that government is strong and ensures safety
+  )
+
+
+
+# We calculate correlations between the variables we hypothesize could be useful for predicting whether someone participated in public demonstrations in past 5 months.
+
+cor_pbldmn <- sapply(filtered_data_1, function(x) cor(x, filtered_data_1$pbldmn))
+print(cor_pbldmn)
+
+
+
+# We focus on variables that are highly correlated and/or are less likely to be correlated with other variables to avoid multicollinearity.
+
+selected_columns <- data %>%
+  filter(cntry %in% c('BG', 'AT', 'DE', 'GB', 'IT', 'IE')) %>%
+  select(polintr, sgnptit, pbldmn, cptppola, badge, agea, nwspol, pstplonl, frprtpl, poltran, gvintcz, ipstrgv)
+
+filtered_data <- selected_columns %>%
+  filter(
+    !(pbldmn %in% c(7, 8, 9)), #Dict
+    !(polintr %in% c(7, 8, 9)), #Cont ++++
+    !(sgnptit %in% c(7, 8, 9)), #Dict
+    !(cptppola %in% c(7, 8, 9)), #Cont+++
+    !(badge %in% c(7, 8, 9)), #Dict
+    !(agea %in% c(999)), #Cont++++++
+    !(nwspol %in% c(7777, 8888, 9999)), #Cont++++
+    !(frprtpl %in% c(7, 8, 9)), #Cont+++++
+    !(poltran %in% c(7, 8, 9)), #Cont++++++
+    !(gvintcz %in% c(7, 8, 9)), #Cont=++++
+    !(pstplonl %in% c(7, 8, 9)), #Dict
+    !(ipstrgv %in% c(7, 8, 9)), #Cont++++++
+  )
+
+#We recode pbldmn outcome variable and invert polarities of negatively correlated variables.
+
+filtered_data$pbldmn <- ifelse(filtered_data$pbldmn == 1, 1, 0)
+variables <- c("polintr", "sgnptit", "badge", "pstplonl", "gvintcz", 'agea')
+# The function inverts variable polarities
+invert_polarity <- function(x) {
+  max_val <- max(x)
+  min_val <- min(x)
+  inverted <- max_val + min_val - x
+  return(inverted)
+}
+# Here we call the function
+filtered_data[, variables] <- lapply(filtered_data[, variables], invert_polarity)
+
+#--------------------Normalizing--------------------------------
+#Next we normalize data.
+filtered_data <- filtered_data %>%
+  mutate_at(vars(polintr, cptppola, ,agea ,nwspol, gvintcz, poltran, frprtpl, ipstrgv),
+            ~ scale(.))
+
+#And lastly, we again run correlation on preprocessed variables to make sure we adjusted polarities correctly.
+
+cor_pbldmn <- sapply(filtered_data, function(x) cor(x, filtered_data$pbldmn))
+print(cor_pbldmn)
+
+
+#----------------------Coverting-Factors-------------------------
+
+# We convert dichotomous variables into factors, as it is easier to work with when using different libraries.
+
+filtered_data <- filtered_data %>%
+  mutate(
+    sgnptit = as.factor(sgnptit),
+    badge = as.factor(badge),
+    pstplonl = as.factor(pstplonl)
+  )
+
+
+# We also split dataset into training and testing data that will be used for testing out final model. The split is 80-20, which should work well due to the high number of cases in our data.
+
+split <- initial_split(filtered_data, prop = 0.8)
+trainData <- training(split)
+testData <- testing(split)
+
+#------------------PLOTS--------------------------------------
+
+# To better visualize variables we are working with and check preprocessing results, we plot variables.
+
+#Plotting continuous variables
+cont_vars <- c("polintr", "cptppola", "agea", "nwspol", "frprtpl", "poltran", "gvintcz", "ipstrgv")
+
+for (var in cont_vars) {
+  plot <- ggplot(filtered_data, aes(x = !!as.name(var))) +
+    geom_histogram(bins = length(unique(filtered_data[[var]]))) +
+    labs(title = paste("Histogram of", var))
+  
+  print(plot)
+}
+
+# Plotting dichotomous variables.
+dict_vars <- c("pbldmn", "sgnptit", "badge", "pstplonl")
+
+for (var in dict_vars) {
+  plot <- ggplot(filtered_data, aes(x = factor(!!as.name(var)))) +
+    geom_bar() +
+    labs(title = paste("Bar Chart of", var))
+  
+  print(plot)
+}
+
+# One interesting thing we can observe from the data, is that our outcome variable has considerable class imbalance. We will use upsampling later to see whether augmenting training data will lead to better results.
+
+#-----------------------Model-----------------------------------
+# We create the model which containts our outcome variable and features.
+
+model1 <- formula("pbldmn ~ polintr + sgnptit + cptppola + badge + agea + nwspol + pstplonl + frprtpl + poltran + gvintcz + ipstrgv")
+
+#-------------------CROSSVAL--------------------------------------
+# Here we do 5-fold crossvalidation to see which model performs best. The models tested are Logistic Regression, Naive Bayes and Support Vector Machines.
+
+#First we define and fit the model
+run_model <- function(fit_function, formula, train_data, test_data) {
+    model <- fit_function(formula, data = train_data)
+    
+    # Predict on the test set
+    if ("svm" %in% class(model)) {
+        prob_predictions <- attr(predict(model, newdata = test_data, probability = TRUE), "probabilities")[, 2]
+    } else if ("naiveBayes" %in% class(model)) {
+        prob_predictions <- predict(model, newdata = test_data, type = "raw")[, 2]
+    } else {
+        prob_predictions <- predict(model, newdata = test_data, type = "response")
+    }
+    
+    test_predictions <- ifelse(prob_predictions > 0.5, 1, 0)
+    
+    # We create a confusion matrix
+    cm <- confusionMatrix(as.factor(test_predictions), as.factor(test_data$pbldmn), positive = "1")
+    
+    # We calculate the ROC AUC
+    roc_auc <- auc(roc(test_data$pbldmn, prob_predictions))
+    
+    # We extract metrics from confusion matrix
+    accuracy <- cm[["overall"]]["Accuracy"]
+    precision <- cm[["byClass"]]["Precision"]
+    recall <- cm[["byClass"]]["Recall"]
+    f1 <- cm[["byClass"]]["F1"]
+    
+    # We return the metrics and confusion matrix as a list
+    return(list(
+        confusion_matrix = cm$table,
+        roc_auc = roc_auc,
+        accuracy = accuracy,
+        precision = precision,
+        recall = recall,
+        f1_score = f1
+    ))
+}
+
+# We define three functions of the learning algorythms we use to pass as arguments to the loop function.
+
+fit_logistic_regression <- function(formula, data) {
+    glm(formula, data = data, family = "binomial")
+}
+
+fit_svm <- function(formula, data) {
+    svm(formula, data = data, type = "C-classification", kernel = "radial", probability = TRUE)
+}
+
+fit_naive_bayes <- function(formula, data) {
+    naiveBayes(formula, data = data)
+}
+
+# Due to the class imbalance in the outcome variables, we settle for only 5 folds for cross validation.
+folds <- createFolds(filtered_data$pbldmn, k = 5)
+
+fit_functions <- list(logistic_regression = fit_logistic_regression, svm = fit_svm, naive_bayes = fit_naive_bayes)
+
+# We create an empty list that will later populate with results
+results <- list()
+
+# The model interates through three learning algorythms and 5 different sets of data used for cross validation. (We use filtered_data for this, trainData and testData will be later used for the selected model)
+
+for (fit_name in names(fit_functions)) {
+    sum_cm <- matrix(0, nrow = 2, ncol = 2)
+    sum_roc_auc <- sum_accuracy <- sum_precision <- sum_recall <- sum_f1 <- 0
+    
+    for (i in seq_along(folds)) {
+        test_indices <- folds[[i]]
+        train_indices <- unlist(folds[-i])
+        
+        train_data <- filtered_data[train_indices, ]
+        test_data <- filtered_data[test_indices, ]
+        
+        metrics <- run_model(fit_functions[[fit_name]], model1, train_data, test_data)
+        
+        sum_cm <- sum_cm + metrics$confusion_matrix
+        sum_roc_auc <- sum_roc_auc + metrics$roc_auc
+        sum_accuracy <- sum_accuracy + as.numeric(metrics$accuracy)
+        sum_precision <- sum_precision + as.numeric(metrics$precision)
+        sum_recall <- sum_recall + as.numeric(metrics$recall)
+        sum_f1 <- sum_f1 + as.numeric(metrics$f1_score)
+    }
+    
+    # We divide everything by 5 as 5 sets of these metrics are summed up in these variables to find their average.
+    avg_cm <- sum_cm / 5
+    avg_roc_auc <- sum_roc_auc / 5
+    avg_accuracy <- sum_accuracy / 5
+    avg_precision <- sum_precision / 5
+    avg_recall <- sum_recall / 5
+    avg_f1 <- sum_f1 / 5
+    
+    results[[fit_name]] <- list(
+        avg_confusion_matrix = avg_cm,
+        avg_roc_auc = avg_roc_auc,
+        avg_accuracy = avg_accuracy,
+        avg_precision = avg_precision,
+        avg_recall = avg_recall,
+        avg_f1 = avg_f1
+    )
+}
+
+#Finally we print out the results to compare three models between each other.
+for (fit_name in names(results)) {
+    cat(paste("Metrics for model:", fit_name, "\n"))
+    cat(paste("Average Confusion Matrix:\n"))
+    print(results[[fit_name]]$avg_confusion_matrix)
+    cat(paste("Average ROC AUC:", results[[fit_name]]$avg_roc_auc, "\n"))
+    cat(paste("Average Accuracy:", results[[fit_name]]$avg_accuracy, "\n"))
+    cat(paste("Average Precision:", results[[fit_name]]$avg_precision, "\n"))
+    cat(paste("Average Recall:", results[[fit_name]]$avg_recall, "\n"))
+    cat(paste("Average F1 Score:", results[[fit_name]]$avg_f1, "\n\n"))
+}
+
+
+#---------------------PLOTS-CROSSVAL-----------------------
+# To better understand the metrics we plot them. The class imbalance is obvious in all three models, as it seems models are more likely to predict class 0 across the board. Despite this however, it seems naive_bayes handles the data better than the other two models. We can see from the chart that it has the most balanced metrics and best recall. Other two models have low recall meaning they often predict 0 when the class is 1 instead. As such, naive_bayes is the best out of the three in 'catching' people who have been on public demonstrations in the last 12 months. While this can be considered to be reason enough to select this model, naive bayes also has better f1 score and only lags a bit behind in precision.
+
+# Extract metrics into a data frame for plotting
+metrics_data <- data.frame(
+    Model = character(),
+    ROC_AUC = numeric(),
+    Accuracy = numeric(),
+    Precision = numeric(),
+    Recall = numeric(),
+    F1_Score = numeric(),
+    stringsAsFactors = FALSE
+)
+
+# Populate the data frame
+for (fit_name in names(results)) {
+    metrics_data <- rbind(metrics_data, data.frame(
+        Model = fit_name,
+        ROC_AUC = as.numeric(results[[fit_name]]$avg_roc_auc),
+        Accuracy = as.numeric(results[[fit_name]]$avg_accuracy),
+        Precision = as.numeric(results[[fit_name]]$avg_precision),
+        Recall = as.numeric(results[[fit_name]]$avg_recall),
+        F1_Score = as.numeric(results[[fit_name]]$avg_f1),
+        stringsAsFactors = FALSE
+    ))
+}
+
+# Reshape data for plotting
+metrics_melted <- reshape2::melt(metrics_data, id.vars = "Model")
+
+# Create a plot
+p <- ggplot(metrics_melted, aes(x = Model, y = value, fill = variable)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    theme_minimal() +
+    labs(x = "Model", y = "Score", title = "Comparison of Model Metrics", fill = "Metric") +
+    scale_y_continuous(limits = c(0, 1)) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Show plot
+print(p)
+
+
+#----------------------NAIVE_BAYES-----------------------------------
+
+
+# Now we will test the algorythm on the training and test data to see how well it performs on the actual dataset.
+ 
+# We create a model that will be used
+run_single_model <- function(fit_function, formula, train_data, test_data) {
+    # Fit the model using the provided fit_function
+    model <- fit_function(formula, data = train_data)
+    
+    # Predict on the test set
+    if ("naiveBayes" %in% class(model)) {
+        prob_predictions <- predict(model, newdata = test_data, type = "raw")[, 2]
+    } else {
+        prob_predictions <- predict(model, newdata = test_data, type = "response")
+    }
+    
+    test_predictions <- ifelse(prob_predictions > 0.5, 1, 0)
+    
+    # Create a confusion matrix
+    cm <- confusionMatrix(as.factor(test_predictions), as.factor(test_data$pbldmn), positive = "1")
+    
+    # Calculate the ROC AUC
+    roc_auc <- auc(roc(test_data$pbldmn, prob_predictions))
+    
+    # Extract metrics from confusion matrix
+    accuracy <- cm[["overall"]]["Accuracy"]
+    precision <- cm[["byClass"]]["Precision"]
+    recall <- cm[["byClass"]]["Recall"]
+    f1 <- cm[["byClass"]]["F1"]
+    
+    # Return the metrics and confusion matrix as a list
+    return(list(
+        confusion_matrix = cm$table,
+        roc_auc = round(as.numeric(roc_auc), 2),
+        accuracy = round(as.numeric(accuracy), 2),
+        precision = round(as.numeric(precision), 2),
+        recall = round(as.numeric(recall), 2),
+        f1_score = round(as.numeric(f1), 2)
+    ))
+}
+
+# Function to fit naive bayes model
+fit_naive_bayes <- function(formula, data) {
+    naiveBayes(formula, data = data)
+}
+
+# Train on trainData and test on testData
+metrics <- run_single_model(fit_naive_bayes, model1, trainData, testData)
+
+# Output metrics
+cat("Metrics for Naive Bayes model trained on trainData and tested on testData:\n")
+cat(paste("Confusion Matrix:\n"))
+print(metrics$confusion_matrix)
+cat(paste("ROC AUC:", metrics$roc_auc, "\n"))
+cat(paste("Accuracy:", metrics$accuracy, "\n"))
+cat(paste("Precision:", metrics$precision, "\n"))
+cat(paste("Recall:", metrics$recall, "\n"))
+cat(paste("F1 Score:", metrics$f1_score, "\n"))
+
+#---------------------TESTING-FINAL-MODEL-------------------------------
+
+# We create model that will be tested both on normal and upsampled data
+
+run_single_model <- function(formula, train_data, test_data) {
+    # Fit the Naive Bayes model
+    model <- naiveBayes(formula, data = train_data)
+    
+    # We predict on the test set
+    prob_predictions <- predict(model, newdata = test_data, type = "raw")[, 2]
+    test_predictions <- ifelse(prob_predictions > 0.5, 1, 0)
+    
+    # We create a confusion matrix
+    cm <- confusionMatrix(as.factor(test_predictions), as.factor(test_data$pbldmn), positive = "1")
+    
+    # We calculate the ROC AUC
+    roc_auc <- auc(roc(test_data$pbldmn, prob_predictions))
+    
+    # We extract metrics from confusion matrix
+    accuracy <- cm[["overall"]]["Accuracy"]
+    precision <- cm[["byClass"]]["Precision"]
+    recall <- cm[["byClass"]]["Recall"]
+    f1 <- cm[["byClass"]]["F1"]
+    
+    # Return the metrics and confusion matrix as a list so we can use it later for comparisons.
+    return(list(
+        confusion_matrix = cm$table,
+        roc_auc = round(as.numeric(roc_auc), 2),
+        accuracy = round(as.numeric(accuracy), 2),
+        precision = round(as.numeric(precision), 2),
+        recall = round(as.numeric(recall), 2),
+        f1_score = round(as.numeric(f1), 2)
+    ))
+}
+
+# Train on normal data
+normal_metrics <- run_single_model(model1, trainData, testData)
+
+# We upsample minority class, which is people who went on public demonstrations
+num_majority <- sum(trainData$pbldmn == 0)
+num_minority <- sum(trainData$pbldmn == 1)
+num_to_sample <- num_majority - num_minority
+minority_samples <- trainData[trainData$pbldmn == 1, ]
+oversampled_minority <- minority_samples[sample(nrow(minority_samples), num_to_sample, replace = TRUE), ]
+upsampled_trainData <- rbind(trainData, oversampled_minority)
+
+# Train on upsampled data
+upsampled_metrics <- run_single_model(model1, upsampled_trainData, testData)
+
+# Output confusion matrices of the normal and upsampled training data
+cat("Confusion Matrix for Normal Data:\n")
+print(normal_metrics$confusion_matrix)
+cat("\nConfusion Matrix for Upsampled Data:\n")
+print(upsampled_metrics$confusion_matrix)
+
+# We combine the calculated metrics
+metrics_data <- data.frame(
+    DataSet = rep(c("Normal", "Upsampled"), each = 5),
+    Metric = rep(c("ROC AUC", "Accuracy", "Precision", "Recall", "F1 Score"), times = 2),
+    Value = c(
+        normal_metrics$roc_auc, normal_metrics$accuracy, normal_metrics$precision, normal_metrics$recall, normal_metrics$f1_score,
+        upsampled_metrics$roc_auc, upsampled_metrics$accuracy, upsampled_metrics$precision, upsampled_metrics$recall, upsampled_metrics$f1_score
+    )
+)
+
+# We plot the metrics
+ggplot(metrics_data, aes(x = Metric, y = Value, fill = DataSet)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    labs(title = "Comparison of Metrics for Normal and Upsampled Data", y = "Value") +
+    theme_minimal()
+
+# Choosing between upsampling and not is difficult. However, upsampling data may be better in this case. Even though false positives increase as evident both from confusion matrix and the plot, model better 'catches' actual cases when people did go to public demonstrations in the last 12 months. As such, it is tempting to use upsampled data for training instead. 
